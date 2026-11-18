@@ -1,0 +1,10 @@
+{
+  "domain": "whirlpool_extras",
+  "name": "Whirlpool Extras",
+  "version": "1.0.0",
+  "dependencies": [
+    "whirlpool"
+  ],
+  "requirements": [],
+  "iot_class": "cloud_push"
+}
