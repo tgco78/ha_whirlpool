@@ -14,7 +14,20 @@
   ],
   "quality_scale": "silver",
   "requirements": [
-    "whirlpool-sixth-sense==2.0.3"
+    "whirlpool-sixth-sense==2.1.0"
   ],
-  "version": "1.0.0"
+  "version": "1.0.0",
+  "categories": [
+    "appliances_cleaning.laundry",
+    "appliances_cleaning.cooking",
+    "climate.heat_pumps_air_conditioning"
+  ],
+  "connectivity": [
+    "cloud"
+  ],
+  "dhcp": [
+    {
+      "macaddress": "88E712*"
+    }
+  ]
 }
