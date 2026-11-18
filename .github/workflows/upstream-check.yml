@@ -1,0 +1,233 @@
+name: Upstream integration check
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+      timezone: Europe/Budapest
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-integration-check
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: github.repository == 'tgco78/ha_whirlpool' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_BRANCH: "main"
+      UPSTREAM: "home-assistant/core"
+      UPSTREAM_PATH: "homeassistant/components/whirlpool"
+      COMPONENT: "whirlpool"
+      LICENSE_PATH: "LICENSE.md"
+      INITIAL_REF: "refs/tags/2026.10.1"
+      INITIAL_SHA: "abe1fdd7cd6b4de1715c87b6fd87d92699514ef9"
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - name: Prepare and validate proposal
+        id: prepare
+        shell: bash
+        run: |
+          git init -q
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "refs/heads/${BASE_BRANCH}"
+          git checkout --detach FETCH_HEAD
+
+          # The baseline advances only when a maintainer merges the proposal.
+          baseline_file=".github/upstream-${COMPONENT}.txt"
+          old_ref="$INITIAL_REF"
+          old_sha="$INITIAL_SHA"
+          if [[ -f "$baseline_file" ]]; then
+            read -r old_ref old_sha extra < "$baseline_file"
+            [[ -z "$extra" ]]
+          fi
+          [[ "$old_sha" =~ ^[0-9a-f]{40}$ ]]
+
+          if [[ "$COMPONENT" == whirlpool ]]; then
+            new_tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+            [[ "$new_tag" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]
+            new_ref="refs/tags/$new_tag"
+            [[ "$old_ref" =~ ^refs/tags/[0-9]{4}\.[0-9]+\.[0-9]+$ ]]
+          else
+            new_ref=refs/heads/master
+            [[ "$old_ref" == "$old_sha" ]]
+          fi
+
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git config remote.upstream.promisor true
+          git config remote.upstream.partialclonefilter blob:none
+          git fetch --no-tags --depth=1 --filter=blob:none upstream "$new_ref"
+          new_sha=$(git rev-parse 'FETCH_HEAD^{commit}')
+          if [[ "$old_sha" == "$new_sha" ]]; then
+            echo "Upstream is already at the accepted revision."
+            exit 0
+          fi
+
+          git fetch --no-tags --depth=1 --filter=blob:none upstream "$old_ref"
+          [[ "$(git rev-parse 'FETCH_HEAD^{commit}')" == "$old_sha" ]]
+          # An upstream license change requires review before importing code.
+          git show "$old_sha:$LICENSE_PATH" > "$RUNNER_TEMP/upstream-license"
+          git diff --exit-code "$old_sha" "$new_sha" -- "$LICENSE_PATH"
+          if ! cmp "$RUNNER_TEMP/upstream-license" "$LICENSE_PATH"; then
+            echo "::error::The downstream license must match the upstream license."
+            exit 1
+          fi
+
+          git cat-file -e "$new_sha:$UPSTREAM_PATH/manifest.json"
+          old_tree=$(git rev-parse "$old_sha:$UPSTREAM_PATH")
+          new_tree=$(git rev-parse "$new_sha:$UPSTREAM_PATH")
+          if [[ "$old_tree" == "$new_tree" ]]; then
+            echo "No upstream component change."
+            exit 0
+          fi
+
+          head="automation/upstream-${COMPONENT}-${new_sha}"
+          prior=$(gh pr list -R "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" \
+            --head "$head" --state all --json number --jq '.[0].number // empty')
+          if [[ -n "$prior" ]]; then
+            echo "This upstream revision already has PR #$prior."
+            exit 0
+          fi
+          pending=$(gh pr list -R "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" \
+            --state open --author 'app/github-actions' --limit 100 --json headRefName \
+            --jq '.[].headRefName')
+          if [[ "$pending" == *"automation/upstream-${COMPONENT}-"* ]]; then
+            echo "An upstream proposal is already open."
+            exit 0
+          fi
+
+          # Three-way apply respects downstream changes and fails on conflicts.
+          # The tree diff keeps the proposal scoped to one integration.
+          git diff --binary --full-index --no-renames "$old_tree" "$new_tree" \
+            -- . ':(exclude)manifest.json' > "$RUNNER_TEMP/upstream.patch"
+          if [[ -s "$RUNNER_TEMP/upstream.patch" ]]; then
+            git update-index --refresh
+            git apply --3way --index --directory="custom_components/$COMPONENT" \
+              "$RUNNER_TEMP/upstream.patch"
+          fi
+
+          export OLD_TREE="$old_tree" NEW_TREE="$new_tree"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def upstream_manifest(tree):
+              return json.loads(subprocess.check_output(
+                  ["git", "show", f"{tree}:manifest.json"]
+              ))
+
+          component = os.environ["COMPONENT"]
+          root = Path("custom_components") / component
+          manifest = root / "manifest.json"
+          old = upstream_manifest(os.environ["OLD_TREE"])
+          new = upstream_manifest(os.environ["NEW_TREE"])
+          local = json.loads(manifest.read_text(encoding="utf-8"))
+          merged = local.copy()
+          missing = object()
+          for key in sorted(old.keys() | new.keys()):
+              previous = old.get(key, missing)
+              incoming = new.get(key, missing)
+              current = local.get(key, missing)
+              if incoming == previous or current == incoming:
+                  continue
+              if current != previous:
+                  raise SystemExit(f"Conflicting manifest field: {key}")
+              if incoming is missing:
+                  merged.pop(key, None)
+              else:
+                  merged[key] = incoming
+
+          if merged != local:
+              manifest.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+                                  encoding="utf-8")
+
+          domains = [component]
+          if component == "whirlpool":
+              domains.append("whirlpool_extras")
+          for domain in domains:
+              path = Path("custom_components") / domain
+              entries = subprocess.check_output(["git", "ls-files", "-sz", "--", str(path)])
+              for entry in entries.split(b"\0"):
+                  if entry and not entry.startswith((b"100644 ", b"100755 ")):
+                      raise SystemExit(f"Unexpected Git file type under {path}: {entry!r}")
+              metadata = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+              if metadata.get("domain") != domain or not metadata.get("version"):
+                  raise SystemExit(f"Invalid domain or missing version: {path}")
+              for source in path.rglob("*.py"):
+                  compile(source.read_bytes(), str(source), "exec")
+              for data in path.rglob("*.json"):
+                  json.loads(data.read_text(encoding="utf-8"))
+
+          if component == "localtuya":
+              required = {"name", "domain", "version", "documentation", "issue_tracker", "codeowners"}
+              if not required <= merged.keys():
+                  raise SystemExit("LocalTuya manifest is missing HACS fields")
+              if {path.name for path in Path("custom_components").iterdir() if path.is_dir()} != {component}:
+                  raise SystemExit("HACS requires one integration per repository")
+              json.loads(Path("hacs.json").read_text(encoding="utf-8"))
+          elif "whirlpool" not in metadata.get("dependencies", []):
+              raise SystemExit("Whirlpool Extras must retain its Whirlpool dependency")
+          PY
+
+          if [[ "$COMPONENT" == localtuya ]]; then
+            new_ref="$new_sha"
+          fi
+          mkdir -p .github
+          printf '%s %s\n' "$new_ref" "$new_sha" > "$baseline_file"
+          git add -- "custom_components/$COMPONENT" "$baseline_file"
+          git diff --cached --check
+          printf 'head=%s\nold_sha=%s\nnew_sha=%s\n' "$head" "$old_sha" "$new_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Open draft pull request
+        if: steps.prepare.outputs.head != ''
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ steps.prepare.outputs.head }}
+          OLD_SHA: ${{ steps.prepare.outputs.old_sha }}
+          NEW_SHA: ${{ steps.prepare.outputs.new_sha }}
+        run: |
+          gh auth setup-git --hostname github.com
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "Propose upstream $COMPONENT update (${NEW_SHA:0:12})"
+
+          existing=$(git ls-remote --heads origin "refs/heads/$HEAD_BRANCH")
+          if [[ -z "$existing" ]]; then
+            git push origin "HEAD:refs/heads/$HEAD_BRANCH"
+          else
+            git fetch --no-tags --depth=1 origin "refs/heads/$HEAD_BRANCH"
+            git diff --exit-code FETCH_HEAD HEAD
+          fi
+
+          gh pr create -R "$GITHUB_REPOSITORY" --draft \
+            --base "$BASE_BRANCH" --head "$HEAD_BRANCH" \
+            --title "Upstream $COMPONENT update (${NEW_SHA:0:12})" \
+            --body "Upstream: https://github.com/$UPSTREAM/compare/$OLD_SHA...$NEW_SHA
+
+          Python syntax and JSON manifests were checked. Review local patches and test the integration with the intended Home Assistant version before merging and updating manually."
+
+      - name: Report failure in GitHub Issues
+        if: failure()
+        shell: bash
+        run: |
+          title="Upstream $COMPONENT check failed"
+          open_issue=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+            --jq ".[] | select(.pull_request == null and .title == \"$title\") | .number")
+          if [[ -z "$open_issue" ]]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" \
+              --body "Review the [failed workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) for the error. Close this issue after resolving the failure."
+          else
+            printf 'An open failure issue already exists: %s\n' "$open_issue"
+          fi
